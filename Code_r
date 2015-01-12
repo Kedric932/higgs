@@ -1,0 +1,415 @@
+require(rpart)
+require(gbm)
+require(randomForest)
+require(ada)
+require(matrixStats)
+
+rm(list=ls())
+
+setwd("C:/Users/Cedric/Higgs")
+train=read.csv("training.csv",sep=",")
+test=read.csv("test.csv",sep=",")
+modele=read.csv("random_submission.csv",sep=",")
+
+Prediction=data.frame(test$EventId)
+
+############### Poids et cible pour GBM #######################
+
+nb_train=dim(train)[1]
+cible=dim(train)[2]
+
+cible_sb=train[,cible]
+train[,cible]=as.numeric(train[,cible])-1
+
+nb_s=length(which(cible_sb=='s'))
+nb_b=nb_train-nb_s
+Poids_tot_S=sum(train$Weight[which(cible_sb=='s')])
+Poids_tot_B=sum(train$Weight[which(cible_sb=='b')])
+poids_neg=length(which(cible_sb=='b'))
+poids_sup=length(which(cible_sb=='s'))
+param_poids=poids_neg/poids_sup
+
+vect_poids_b=train$Weight/Poids_tot_B
+vect_poids_s=train$Weight/Poids_tot_S
+vect_poids=vect_poids_b
+vect_poids[which(cible_sb=='s')]=vect_poids_s[which(cible_sb=='s')]
+#################### Traitement des NA ########################
+
+Pred.eval=data.frame()
+
+for (tour in 1:5){
+
+samp=sample(1:250000,200000,replace=TRUE)
+
+Construction_initial=train[samp,2:31]
+Label_Const=train[samp,cible]
+Evaluation_initial=train[-samp,2:31]
+Label_Test=train[-samp,cible]
+
+
+gbm_initial<-gbm(Label_Const~.,
+data=Construction_initial,
+distribution="adaboost",
+weight=vect_poids[samp],
+n.trees=10,
+shrinkage=0.01,
+interaction.depth=15,
+bag.fraction = 0.7,
+train.fraction = 0.9,
+n.minobsinnode = 1,
+verbose=TRUE)
+
+#print(pretty.gbm.tree(gbm1,gbm1$n.trees))
+
+gbm_initial2=gbm.more(gbm_initial,4990)
+best.iter<-gbm.perf(gbm_initial2,method="test")
+summary(gbm_initial2,n.trees=best.iter) #,based,on,the,first,tree
+gbm.predict<-predict(gbm_initial2,Evaluation_initial,best.iter)
+
+Pred.eval1=data.frame(train[-samp,c(1,32:33)],gbm.predict)
+if (tour==1){
+Pred.eval=data.frame(Pred.eval1)
+} else {
+Pred.eval=rbind(Pred.eval,Pred.eval1)
+}
+
+gbm.predict<-predict(gbm_initial2,test,best.iter)
+Prediction=data.frame(Prediction,gbm.predict)
+
+
+print(dim(Prediction))
+print(dim(Pred.eval))
+
+print (tour)
+}
+
+
+
+names(Pred.eval)= c("EventId","Weight","Label","gbm.predict")
+
+########################################################
+########### Classification poids #######################
+
+class_poids=kmeans(train$Weight,3, nstart = 25)
+require(randomForest)
+
+
+samp=list()
+A_sampler=c(1:nb_train)
+for (i in 1:3){
+samp[[i]]=sample(A_sampler,62500)
+A_sampler=setdiff(A_sampler,samp[[i]])
+}
+samp[[4]]=A_sampler
+
+cl_train=data.frame(train$EventId)
+names(cl_train)="EventId"
+cl_test=data.frame(test$EventId)
+names(cl_test)="EventId"
+
+for (i in 2:4){
+ech=samp[[i]]
+
+Construction=train[ech,2:31]
+Label_Const=class_poids$cluster[ech]
+Evaluation=train[-ech,2:31]
+
+poids.rf <- randomForest(x=Construction,y=as.factor(Label_Const), importance=TRUE,try=6,ntree=500)
+predict.RF_eval=data.frame(train$EventId[-ech],predict(poids.rf, Evaluation,type="prob"))
+names(predict.RF_eval)[1]="EventId"
+cl_train=merge(cl_train,predict.RF_eval,by="EventId",all.x=TRUE)
+
+predict.RF_test=data.frame(test$EventId,predict(poids.rf, test,type="prob"))
+names(predict.RF_test)[1]="EventId"
+cl_test=merge(cl_test,predict.RF_test,by="EventId",all.x=TRUE)
+}
+
+list_classe=list()
+list_classe[[1]]=c(2,5,8,11)
+list_classe[[2]]=list_classe[[1]]+1
+list_classe[[3]]=list_classe[[2]]+1
+
+
+essai_rs=rowSums(cl_train[,list_classe[[1]]],na.rm=TRUE)/3
+
+for (i in 1:3){
+cl_train=data.frame(cl_train,(rowSums(cl_train[,list_classe[[i]]],na.rm=TRUE)/3))
+cl_test=data.frame(cl_test,(rowSums(cl_test[,list_classe[[i]]],na.rm=TRUE)/4))
+}
+cl_train_poids=cl_train[,c(1,17:19)]
+for (i in 1:3){
+cl_train_poids[,4+i]=cl_train_poids[,1+i]*class_poids$centers[i]
+}
+cl_train_poids$eval=rowSums(cl_train_poids[,5:7])
+cl_test_poids=cl_test[,c(1,17:19)]
+for (i in 1:3){
+cl_test_poids[,4+i]=cl_test_poids[,1+i]*class_poids$centers[i]
+}
+cl_test_poids$eval=rowSums(cl_test_poids[,5:7])
+
+
+########################################################
+########### Fonctions AMS ##############################
+########################################################
+
+
+
+ams_big <- function(x,z){
+Pred.eval_big=z
+Label_pred=rep(0,dim(Pred.eval_big)[1])
+Weigth_Num=Pred.eval_big$Weight
+
+sel_sup=which(Pred.eval_big$gbm.predict>x)
+Label_pred[sel_sup]=1
+
+obs=Pred.eval_big$Label
+pred=Label_pred
+weigth=Weigth_Num
+Poids_test_S=sum(weigth[which(obs==1)])
+Poids_test_B=sum(weigth[which(obs==0)])
+
+egal_s=intersect(which(obs==1),which(pred==1))
+s=sum(weigth[egal_s])*Poids_tot_S/Poids_test_S
+rate_s=intersect(which(obs==0),which(pred==1))
+b=sum(weigth[rate_s])*Poids_tot_B/Poids_test_B
+ams_calcul=sqrt(2*((b+s+10)*log(1+s/(b+10))-s))
+return (ams_calcul)
+}
+
+
+sample_equil <- function(n){
+samp=sample(1:(dim(Pred.eval)[1]),n)
+Pred.eval_big=Pred.eval[samp,]
+return (Pred.eval_big)
+}
+
+
+
+max_AMS <- function(fichier){
+
+Seq_AMS=seq(1.2,1.6,by=0.01)
+Les_AMS=c()
+for (i in 1:41){
+seuil=Seq_AMS[i]
+Les_AMS[i]=ams_big(seuil,fichier)
+}
+MAX_seq=which.max(Les_AMS)
+MAX=Seq_AMS[MAX_seq]
+return(MAX)
+}
+
+
+
+##################### Lance plusieurs échantillon
+
+btstp_AMS <- function(n){
+
+mat_Max=matrix(0,nrow=n,ncol=2)
+for (ech in 1:n){
+
+f=sample_equil(250000)
+coef_max=max_AMS(f)
+le_max=ams_big(coef_max,f)
+mat_Max[ech,]=c(coef_max,le_max)
+print(mat_Max[1:ech,])
+}
+return (mat_Max)
+}
+
+
+z=sample_equil(200000)
+ams_big(0.74,z)
+max_AMS(z)
+
+a=btstp_AMS(50)
+print(a)
+b=colMeans(a)
+b
+
+1.445600 3.640686
+ 
+ 
+names(Prediction)[1]="EventId"
+Prediction$moy=rowMeans(Prediction[,2:6])
+
+
+rank_ET=rank(Prediction$moy+test[,1]/1000000)
+nb_test=dim(test)[1]
+rank_ET1=nb_test+1-rank_ET
+rank_ET2=format(round(rank_ET1,0), scientific = FALSE)
+
+
+pred=rep('b',550000)
+
+sel_sup=which(Prediction$moy>b[1])
+pred[sel_sup]="s"
+
+length(which(pred=='s'))/550000
+
+submission=data.frame(Prediction$EventId,rank_ET2,pred)
+colnames(submission)=c("EventId","RankOrder","Class")
+
+write.csv(submission,"gbm_29juin_gbm1.4456_.csv",row.names = FALSE)
+
+
+pred=rep('b',550000)
+
+sel_sup=which(Prediction$moy>1.3)
+pred[sel_sup]="s"
+
+length(which(pred=='s'))/550000
+
+submission=data.frame(Prediction$EventId,rank_ET2,pred)
+colnames(submission)=c("EventId","RankOrder","Class")
+
+write.csv(submission,"gbm_29juin_gbm1.3_.csv",row.names = FALSE)
+
+############################################################"
+####################" Classes
+#############################################################
+
+
+#################################################
+####################################################
+
+#################### Traitement des NA ########################
+names(Pred.eval)= c("EventId","Weight","Label","gbm.predict")
+
+
+new.train=train[,2:31]
+new.test=test[,2:31]
+
+
+traitement_NA=rbind(new.train,new.test)
+nb_enr=dim(traitement_NA)[1]
+Les_na=matrix(0,nrow=nb_enr,ncol=30)
+
+traitement_NA_Et1=traitement_NA
+
+for (colo in 1:30){
+sel999=which(traitement_NA[,colo]==-999)
+Median=median(traitement_NA[-sel999,colo])
+traitement_NA_Et1[sel999,colo]=Median
+Les_na[sel999,colo]=1
+}
+
+Les_col_Na=rowSums(Les_na)
+
+Classe=data.frame(train$EventId,Les_col_Na[1:250000])
+names(Classe)=c("EventId","Clas")
+Err_classe <- merge(Pred.eval, Classe, by = "EventId")
+Err_classe$pred=0
+Err_classe$pred[which(Err_classe$gbm.predict>b[1])]=1
+Err_classe$type="VN"
+Err_classe$type[which(Err_classe$pred==1&Err_classe$Label==1)]="VP"
+Err_classe$type[which(Err_classe$pred==1&Err_classe$Label==0)]="FP"
+Err_classe$type[which(Err_classe$pred==0&Err_classe$Label==1)]="FN"
+Err_classe$count=1
+
+ag <- aggregate(cbind(Weight,count) ~ as.factor(Clas)+as.factor(type), data = Err_classe, sum)
+
+
+sample_equil <- function(n){
+samp=sample(1:(dim(Pred.eval)[1]),n)
+samp_classe=Err_classe[samp,]
+return (samp_classe)
+}
+
+ams_total <- function(x,fichier){
+samp_classe=fichier
+Nb_Eval=dim(samp_classe)[1]
+Label_pred=rep(0,Nb_Eval)
+Weigth_Num=samp_classe$Weight
+
+Les_classes=c(0,1,7,8,10,11)
+for (num_classe in 1:6){
+classe=Les_classes[num_classe]
+Groupe=which(samp_classe$Clas==classe)
+Nb_Groupe=length(Groupe)
+sel_sup=which(samp_classe$gbm.predict[Groupe]>x[num_classe])
+sel_pred1=Groupe[sel_sup]
+Label_pred[sel_pred1]=1
+}
+
+obs=samp_classe$Label
+pred=Label_pred
+weigth=Weigth_Num
+Poids_test_S=sum(weigth[which(obs==1)])
+Poids_test_B=sum(weigth[which(obs==0)])
+
+egal_s=intersect(which(obs==1),which(pred==1))
+s=sum(weigth[egal_s])*Poids_tot_S/Poids_test_S
+rate_s=intersect(which(obs==0),which(pred==1))
+b=sum(weigth[rate_s])*Poids_tot_B/Poids_test_B
+ams_calcul=sqrt(2*((b+s+10)*log(1+s/(b+10))-s))
+return (ams_calcul)
+}
+
+
+##### init gbm
+
+max_ams_total <- function(fichier){
+init=rep(1.5,6)
+Seq_AMS=seq(1,3,by=0.05)
+for(z in 1:2){
+for (j in 1:6){
+Les_AMS=c()
+for (i in 1:42){
+seuil=Seq_AMS[i]
+init[j]=seuil
+Les_AMS[i]=ams_total(init,fichier)
+}
+MAX=which.max(Les_AMS)
+
+init[j]=Seq_AMS[MAX]
+}
+}
+return(init)
+}
+
+btstp_AMS <- function(n){
+
+mat_Max=matrix(0,nrow=n,ncol=7)
+for (ech in 1:n){
+samp_classe=sample_equil(300000)
+coef_max=max_ams_total(samp_classe)
+le_max=ams_total(coef_max,samp_classe)
+mat_Max[ech,]=c(coef_max,le_max)
+print(mat_Max[1:ech,])
+}
+return (mat_Max)
+}
+
+samp_classe=sample_equil(500000)
+ams_total(init,samp_classe)
+
+
+a=btstp_AMS(50)
+print(a)
+b=colMeans(a)
+b
+
+
+rank_ET=rank(Prediction$moy+test[,1]/1000000)
+nb_test=dim(test)[1]
+rank_ET1=nb_test+1-rank_ET
+rank_ET2=format(round(rank_ET1,0), scientific = FALSE)
+
+Test.classe=Les_col_Na[250001:800000]
+pred=rep('b',550000)
+
+essai_seuil=c(1.4,2,1.4,2,1.4,2)
+Les_classes=c(0,1,7,8,10,11)
+for (num_classe in 1:6){
+classe=Les_classes[num_classe]
+sel=which(Test.classe==classe)
+sel_sup=which(Prediction$moy[sel]>essai_seuil[num_classe])
+sel_pred1=sel[sel_sup]
+pred[sel_pred1]="s"
+}
+length(which(pred=='s'))/550000
+
+submission=data.frame(Prediction$EventId,rank_ET2,pred)
+colnames(submission)=c("EventId","RankOrder","Class")
+
+write.csv(submission,"gbm_29juin_multi_manuel_.csv",row.names = FALSE)
